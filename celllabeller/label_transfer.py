@@ -100,40 +100,61 @@ class CellTypeLabelTransfer:
         """
         logger.info("Preparing data for scVI integration...")
         
+        # IMPORTANT: Subset to common genes FIRST to reduce memory usage
+        logger.info(f"Reference shape before subset: {self.reference_adata.shape}")
+        logger.info(f"Query shape before subset: {self.query_adata.shape}")
+        
+        if len(self.reference_adata.var) != len(self.query_adata.var):
+            logger.warning("Reference and Query have different genes. Subsetting to common genes...")
+            self.subset_common_genes()
+        
+        logger.info(f"Reference shape after subset: {self.reference_adata.shape}")
+        logger.info(f"Query shape after subset: {self.query_adata.shape}")
+        
         # Add dataset identifier
         self.reference_adata.obs["dataset"] = "reference"
         self.query_adata.obs["dataset"] = "query"
         
-        # Concatenate datasets
-        integrated = ad.concat(
+        # Concatenate datasets with inner join (only common genes, already subset above)
+        logger.info("Concatenating datasets with inner join (memory-efficient)...")
+        integrated = sc.concat(
             [self.reference_adata, self.query_adata],
-            axis=0,
+            join="inner",  # Changed from "outer" to "inner" for memory efficiency
             label="dataset_id",
             keys=["reference", "query"],
+            axis=0,
         )
         
         logger.info(f"Integrated dataset shape: {integrated.shape}")
+        logger.info(f"Integrated matrix type: {type(integrated.X)}, dtype: {integrated.X.dtype}")
         
-        # Normalize and log transform
-        logger.info("Preprocessing data...")
+        # Ensure sparse matrix representation (memory efficient)
+        if not hasattr(integrated.X, 'toarray'):
+            logger.warning("Converting to sparse matrix...")
+            from scipy.sparse import csr_matrix
+            integrated.X = csr_matrix(integrated.X)
+        
+        # Normalize and log transform (keep sparse)
+        logger.info("Preprocessing data (preserving sparse matrix)...")
         sc.pp.normalize_total(integrated, target_sum=1e4)
         sc.pp.log1p(integrated)
         
-        # Setup scVI
+        # Setup scVI with batch correction on dataset_id
         logger.info("Setting up scVI model...")
         scvi.model.SCVI.setup_anndata(
             integrated,
-            batch_key="dataset",
-            batch_correction=self.batch_key is not None,
+            batch_key="dataset_id",  # Use the key from concat
+            batch_correction=True,
         )
         
-        # Train scVI model
+        # Train scVI model with memory optimization
         logger.info(f"Training scVI model for {self.n_epochs} epochs...")
-        model = scvi.model.SCVI(integrated)
+        model = scvi.model.SCVI(integrated, n_latent=30)  # 30 latent dims sufficient
         model.train(
             max_epochs=self.n_epochs,
             early_stopping=True,
             early_stopping_patience=10,
+            accelerator="gpu" if self.device == "gpu" else "cpu",
         )
         
         # Get latent representation
@@ -144,6 +165,11 @@ class CellTypeLabelTransfer:
         model_path = self.results_dir / "scvi_model"
         logger.info(f"Saving scVI model to {model_path}")
         model.save(str(model_path), overwrite=True)
+        
+        # Clear model from memory
+        del model
+        import gc
+        gc.collect()
         
         self.integrated_adata = integrated
         
