@@ -36,7 +36,6 @@ setup(
         "tqdm>=4.62.0",
         "joblib>=1.1.0",
         "optuna>=2.10.0",
-        "pytorch>=1.10.0",
     ],
     extras_require={
         "dev": [
